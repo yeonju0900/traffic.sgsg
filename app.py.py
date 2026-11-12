@@ -2,7 +2,6 @@ import os
 import pickle
 import numpy as np
 import streamlit as st
-from Orange.data import Table
 
 # ---------------------------------------------------------
 # 1. 페이지 기본 설정
@@ -17,15 +16,51 @@ MODEL_PATH = "traffic_casualty_model.pkcls"
 
 
 # ---------------------------------------------------------
-# 2. Orange3 모델 로드 (캐싱 적용)
+# 2. Orange3 .pkcls 경량 로더 (orange3 미설치 환경 호환)
 # ---------------------------------------------------------
+class _OrangeStub:
+    def __init__(self, *args, **kwargs):
+        self._args = args
+        self._kwargs = kwargs
+
+    def __setstate__(self, state):
+        if isinstance(state, dict):
+            self.__dict__.update(state)
+        else:
+            self._state = state
+
+
+def _make_variable_stub(*args, **kwargs):
+    obj = _OrangeStub(*args, **kwargs)
+    for item in args:
+        if isinstance(item, str) and not hasattr(obj, "_name"):
+            obj._name = item
+        elif isinstance(item, (tuple, list)) and not hasattr(obj, "values"):
+            obj.values = list(item)
+    return obj
+
+
+class _OrangeCompatibleUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        # NumPy 2.x 저장 모델과 NumPy 1.x 실행 환경 간 호환 처리
+        if module.startswith("numpy._core"):
+            module = module.replace("numpy._core", "numpy.core", 1)
+
+        # Orange3 및 내부 sklearn 객체를 경량 컨테이너로 역직렬화
+        if module.startswith("Orange") or module.startswith("sklearn"):
+            if name == "make_variable":
+                return _make_variable_stub
+            return type(name, (_OrangeStub,), {})
+
+        return super().find_class(module, name)
+
+
 @st.cache_resource
 def load_orange_model(model_path: str):
     if not os.path.exists(model_path):
         return None
     with open(model_path, "rb") as f:
-        model = pickle.load(f)
-    return model
+        return _OrangeCompatibleUnpickler(f).load()
 
 
 model = load_orange_model(MODEL_PATH)
@@ -35,26 +70,70 @@ model = load_orange_model(MODEL_PATH)
 # ---------------------------------------------------------
 st.title("🚦 교통사고 예상 사망자 수 예측 & 어린이 보호구역 안전 신호등")
 st.markdown(
-    "시도 선택 및 **사고건수·경상자수**를 슬라이더로 조절하면 Orange3 학습 모델이 **예상 사망자 수**를 실시간으로 계산하고, 위험도에 따른 **대형 신호등과 스쿨존 안전 수칙**을 안내합니다."
+    "시도 선택 및 **사고건수·경상자수**를 슬라이더로 조절하면 학습된 모델이 **예상 사망자 수**를 실시간으로 계산하고, 위험도에 따른 **대형 신호등과 스쿨존 안전 수칙**을 안내합니다."
 )
 st.divider()
 
 if model is None:
     st.error(
         f"⚠️ 모델 파일(`{MODEL_PATH}`)을 찾을 수 없습니다. "
-        "GitHub 저장소의 `app.py`와 같은 폴더에 `traffic_casualty_model.pkcls` 파일을 업로드해주세요."
+        "GitHub 저장소 최상위 폴더에 `traffic_casualty_model.pkcls` 파일이 있는지 확인해주세요."
     )
     st.stop()
 
-# 모델의 original_domain에서 시도 목록 추출 (기본값: ['경기', '부산', '서울'])
-domain = model.original_domain
-sido_var = domain["시도"]
-sido_options = list(sido_var.values) if hasattr(sido_var, "values") else ["경기", "부산", "서울"]
+# 모델 도메인에서 시도 목록 추출
+sido_options = ["경기", "부산", "서울"]
+orig_domain = getattr(model, "original_domain", None)
+if orig_domain is not None and hasattr(orig_domain, "attributes"):
+    for attr in orig_domain.attributes:
+        if getattr(attr, "_name", "") == "시도" and hasattr(attr, "values"):
+            sido_options = list(attr.values)
+            break
 
 
 # ---------------------------------------------------------
-# 4. 실시간 예측 함수
+# 4. 전처리 및 신경망 실시간 예측 함수
 # ---------------------------------------------------------
+def _eval_preprocess_node(node, raw_inputs: dict) -> float:
+    node_type = type(node).__name__
+
+    if node_type == "Normalizer":
+        base_val = _eval_preprocess_node(node.variable, raw_inputs)
+        return (base_val - float(node.offset)) * float(node.factor)
+
+    if node_type == "Indicator":
+        sido_val = raw_inputs.get("시도", "")
+        disc_var = node.variable
+        categories = list(getattr(disc_var, "values", sido_options))
+        idx = categories.index(sido_val) if sido_val in categories else -1
+        return 1.0 if idx == int(node.value) else 0.0
+
+    if node_type == "ReplaceUnknowns":
+        var_name = getattr(node.variable, "_name", "")
+        val = raw_inputs.get(var_name, np.nan)
+        if val is None or np.isnan(val):
+            return float(node.value)
+        return float(val)
+
+    compute_child = getattr(node, "_compute_value", None)
+    if compute_child is not None:
+        return _eval_preprocess_node(compute_child, raw_inputs)
+
+    var_name = getattr(node, "_name", "")
+    val = raw_inputs.get(var_name, 0.0)
+    return 0.0 if (val is None or np.isnan(val)) else float(val)
+
+
+def _apply_activation(x: np.ndarray, act_name: str) -> np.ndarray:
+    if act_name == "relu":
+        return np.maximum(0.0, x)
+    if act_name == "tanh":
+        return np.tanh(x)
+    if act_name == "logistic":
+        return 1.0 / (1.0 + np.exp(-x))
+    return x
+
+
 def predict_casualties(
     trained_model,
     sido: str,
@@ -63,34 +142,40 @@ def predict_casualties(
     severe_injuries: float = np.nan,
     reported_injuries: float = np.nan,
 ) -> float:
-    """
-    Orange3 모델의 original_domain 형식에 맞춰 Table을 생성하고 예측값을 반환합니다.
-    입력되지 않은 변수(np.nan)는 모델 내부의 ReplaceUnknowns 전처리기가 학습 평균값으로 자동 보정합니다.
-    """
-    orig_domain = trained_model.original_domain
-    row = []
-    for attr in orig_domain.attributes:
-        if attr.name == "시도":
-            row.append(sido)
-        elif attr.name == "사고건수":
-            row.append(float(accidents))
-        elif attr.name == "중상자수":
-            row.append(float(severe_injuries))
-        elif attr.name == "경상자수":
-            row.append(float(minor_injuries))
-        elif attr.name == "부상신고자수":
-            row.append(float(reported_injuries))
-        else:
-            row.append(np.nan)
+    raw_inputs = {
+        "시도": sido,
+        "사고건수": float(accidents),
+        "중상자수": float(severe_injuries),
+        "경상자수": float(minor_injuries),
+        "부상신고자수": float(reported_injuries),
+    }
 
-    input_table = Table.from_list(orig_domain, [row])
-    pred = trained_model(input_table)
-    # 회귀 모델 특성상 음수가 나올 경우 0.0으로 보정
-    return max(0.0, float(pred[0]))
+    # 모델 내부 전처리 파이프라인(Indicator, ReplaceUnknowns, Normalizer) 적용
+    features = [
+        _eval_preprocess_node(attr, raw_inputs)
+        for attr in trained_model.domain.attributes
+    ]
+    x = np.array([features], dtype=np.float64)
+
+    # 신경망(MLPRegressor) 순전파 계산
+    skl = trained_model.skl_model
+    coefs = [np.asarray(w, dtype=np.float64) for w in skl.coefs_]
+    intercepts = [np.asarray(b, dtype=np.float64) for b in skl.intercepts_]
+    hidden_act = getattr(skl, "activation", "relu")
+    out_act = getattr(skl, "out_activation_", "identity")
+
+    for idx, (w, b) in enumerate(zip(coefs, intercepts)):
+        x = x @ w + b
+        if idx < len(coefs) - 1:
+            x = _apply_activation(x, hidden_act)
+        else:
+            x = _apply_activation(x, out_act)
+
+    return max(0.0, float(x.ravel()[0]))
 
 
 # ---------------------------------------------------------
-# 5. 사이드바: 신호등 판정 기준 설정 (선택적 조정 가능)
+# 5. 사이드바: 신호등 판정 기준 설정
 # ---------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ 신호등 위험도 기준 설정")
@@ -104,7 +189,6 @@ with st.sidebar:
     st.divider()
     st.markdown("**📊 모델 정보**")
     st.write(f"- 알고리즘: `{getattr(model, 'name', 'Neural Network')}`")
-    st.write(f"- 타깃 변수: `{domain.class_var.name}`")
     st.write(f"- 지원 시도: `{', '.join(sido_options)}`")
 
 
@@ -192,7 +276,6 @@ else:
     yellow_style = "background:#3f3517; opacity:0.25;"
     green_style = "background:#143522; opacity:0.25;"
 
-
 with col_result:
     st.subheader("🚨 실시간 예측 결과 및 대형 신호등")
 
@@ -208,7 +291,6 @@ with col_result:
         padding: 24px 28px;
         margin-bottom: 12px;
     ">
-        <!-- 대형 3구 신호등 본체 -->
         <div style="
             background: #1e293b;
             padding: 18px 20px;
@@ -226,7 +308,6 @@ with col_result:
             <div style="width: 64px; height: 64px; border-radius: 50%; {green_style} transition: all 0.25s;"></div>
         </div>
 
-        <!-- 예측 수치 및 상태 텍스트 -->
         <div style="flex: 1;">
             <div style="font-size: 1.1rem; font-weight: 700; color: {accent_color}; margin-bottom: 6px;">
                 [{selected_sido}] 실시간 위험도 판정
